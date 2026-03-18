@@ -5,21 +5,18 @@ strix_halo_pipeline.py — NPU+GPU LLM Inference for AMD Strix Halo on Linux
 
 First-of-its-kind: Runs LLMs across XDNA2 NPU and RDNA 3.5 iGPU simultaneously.
 
-NPU (FastFlowLM) drafts tokens instantly → GPU (llama.cpp Vulkan) continues with
-a larger model. Both accelerators share 128GB unified LPDDR5X via GPUVM.
-
 Usage:
     python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3-8B-Q4_K_M.gguf
-    python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3.5-27B-Q4_K_M.gguf --draft qwen3:4b
-    python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3-8B-Q4_K_M.gguf --pmode turbo -v
+    python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3.5-27B-Q4_K_M.gguf --draft qwen3:4b --pmode turbo -v
 
-Connect any OpenAI-compatible client to: http://<your-ip>:11435/v1
+Connect Open WebUI (Ollama mode) to: http://<your-ip>:11435
+Connect OpenAI clients to: http://<your-ip>:11435/v1
 
 Author:  Mike Alani / Claude collaboration
 License: MIT
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import asyncio
@@ -35,7 +32,6 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import AsyncIterator, Optional
 
 try:
@@ -49,25 +45,16 @@ except ImportError:
     from aiohttp import web
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Configuration
-# ═════════════════════════════════════════════════════════════════════════════
-
 @dataclass
 class PipelineConfig:
-    # Draft model (NPU via FastFlowLM)
     draft_model: str = "qwen3:1.7b"
     draft_pmode: str = "performance"
     draft_port: int = 52625
-
-    # Verifier model (GPU via llama.cpp)
     gpu_model: str = ""
     gpu_port: int = 9999
     gpu_ctx: int = 4096
     gpu_layers: int = 99
     gpu_threads: int = 8
-
-    # Pipeline engine
     port: int = 11435
     host: str = "0.0.0.0"
     draft_tokens: int = 128
@@ -78,26 +65,22 @@ class PipelineConfig:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Environment Setup
+# Environment
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Environment:
-    """Detects and fixes Strix Halo environment issues."""
-
-    def __init__(self, log: logging.Logger):
+    def __init__(self, log):
         self.log = log
 
     def fix_vulkan(self):
-        """Fix common Vulkan ICD path issue on Strix Halo."""
         correct_icd = "/usr/share/vulkan/icd.d/radeon_icd.json"
         current = os.environ.get("VK_ICD_FILENAMES", "")
         if "latest-vulkan" in current or not current:
             if os.path.exists(correct_icd):
                 os.environ["VK_ICD_FILENAMES"] = correct_icd
-                self.log.info(f"Fixed VK_ICD_FILENAMES → {correct_icd}")
+                self.log.info(f"Fixed VK_ICD_FILENAMES -> {correct_icd}")
 
     def fix_xrt_symlinks(self):
-        """Create XRT lib symlinks that FLM expects."""
         target = "/opt/xilinx/xrt/lib/x86_64-linux-gnu"
         source = "/opt/xilinx/xrt/lib"
         if os.path.exists(source) and not os.path.exists(os.path.join(target, "libxrt_core.so.2")):
@@ -109,13 +92,9 @@ class Environment:
                         os.symlink(f, link)
                 self.log.info("Created XRT symlinks")
             except PermissionError:
-                self.log.warning("Cannot create XRT symlinks — run once with:")
-                self.log.warning(f"  sudo mkdir -p {target}")
-                self.log.warning(f"  sudo bash -c 'for f in {source}/*.so*; "
-                                 f"do ln -sf \"$f\" {target}/$(basename \"$f\"); done'")
+                self.log.warning("Cannot create XRT symlinks - run with sudo once")
 
     def set_gpu_performance(self):
-        """Attempt to set GPU to performance mode."""
         for card in glob.glob("/sys/class/drm/card*/device/power_dpm_force_performance_level"):
             try:
                 with open(card, "w") as f:
@@ -124,15 +103,13 @@ class Environment:
             except PermissionError:
                 pass
 
-    def find_flm(self) -> Optional[str]:
-        """Find FLM binary."""
+    def find_flm(self):
         for path in [shutil.which("flm"), "/opt/fastflowlm/bin/flm"]:
             if path and os.path.isfile(path) and os.access(path, os.X_OK):
                 return path
         return None
 
-    def find_llama_server(self) -> Optional[tuple]:
-        """Find llama-server binary with Vulkan support. Returns (binary, lib_dir)."""
+    def find_llama_server(self):
         candidates = [
             os.path.expanduser("~/llama.cpp/build-vulkan/bin/llama-server"),
             os.path.expanduser("~/llama.cpp/build/bin/llama-server"),
@@ -144,22 +121,16 @@ class Environment:
                 return path, os.path.dirname(path)
         return None, None
 
-    def find_gpu_model(self, explicit: str = "") -> Optional[str]:
-        """Find a GGUF model file."""
+    def find_gpu_model(self, explicit=""):
         if explicit and os.path.isfile(explicit):
             return os.path.abspath(explicit)
-        search_dirs = [
-            os.path.expanduser("~/vitias/models"),
-            os.path.expanduser("~/models"),
-            ".",
-            "./models",
-        ]
-        for d in search_dirs:
+        for d in ["~/vitias/models", "~/models", ".", "./models"]:
+            d = os.path.expanduser(d)
             for f in glob.glob(os.path.join(d, "*.gguf")):
                 return os.path.abspath(f)
         return None
 
-    def check_npu(self) -> bool:
+    def check_npu(self):
         return os.path.exists("/dev/accel/accel0")
 
     def setup_all(self):
@@ -173,102 +144,72 @@ class Environment:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class ProcessManager:
-    """Manages FLM and llama.cpp server processes."""
-
-    def __init__(self, config: PipelineConfig, log: logging.Logger):
+    def __init__(self, config, log):
         self.config = config
         self.log = log
         self.env = Environment(log)
-        self.procs: list[subprocess.Popen] = []
+        self.procs = []
 
-    def _wait_for_health(self, url: str, timeout: int = 120, check_text: str = ""):
-        """Poll a URL until it responds."""
+    def _wait_for_health(self, url, timeout=120, check_text=""):
         import urllib.request
-        for i in range(timeout):
+        for _ in range(timeout):
             try:
-                req = urllib.request.Request(url)
-                with urllib.request.urlopen(req, timeout=2) as r:
+                with urllib.request.urlopen(urllib.request.Request(url), timeout=2) as r:
                     if check_text:
                         if check_text in r.read().decode():
                             return True
-                    else:
-                        if r.status == 200:
-                            return True
+                    elif r.status == 200:
+                        return True
             except Exception:
                 pass
             time.sleep(1)
         return False
 
-    def start_flm(self) -> bool:
-        """Start FastFlowLM NPU server."""
+    def start_flm(self):
         flm_bin = self.env.find_flm()
         if not flm_bin:
-            self.log.error("FLM not found. Install FastFlowLM: https://github.com/FastFlowLM/FastFlowLM")
+            self.log.error("FLM not found")
             return False
-
-        if not self.env.check_npu():
-            self.log.warning("NPU device /dev/accel/accel0 not found")
-
         self.log.info(f"Starting NPU: {self.config.draft_model} (pmode={self.config.draft_pmode}) on :{self.config.draft_port}")
-
         proc = subprocess.Popen(
             [flm_bin, "serve", self.config.draft_model,
              "--pmode", self.config.draft_pmode,
              "--port", str(self.config.draft_port)],
             stdout=subprocess.DEVNULL if not self.config.verbose else None,
-            stderr=subprocess.DEVNULL if not self.config.verbose else None,
-        )
+            stderr=subprocess.DEVNULL if not self.config.verbose else None)
         self.procs.append(proc)
-
-        if self._wait_for_health(
-            f"http://127.0.0.1:{self.config.draft_port}/v1/models", timeout=60
-        ):
-            self.log.info(f"NPU ready ✓ (PID: {proc.pid})")
+        if self._wait_for_health(f"http://127.0.0.1:{self.config.draft_port}/v1/models", timeout=60):
+            self.log.info(f"NPU ready (PID: {proc.pid})")
             return True
-
-        self.log.error("FLM failed to start — check NPU driver and model")
+        self.log.error("FLM failed to start")
         return False
 
-    def start_llama(self) -> bool:
-        """Start llama.cpp Vulkan GPU server."""
+    def start_llama(self):
         llama_bin, llama_lib = self.env.find_llama_server()
         if not llama_bin:
-            self.log.error("llama-server not found. Build llama.cpp with -DGGML_VULKAN=ON")
+            self.log.error("llama-server not found")
             return False
-
         model = self.env.find_gpu_model(self.config.gpu_model)
         if not model:
-            self.log.error(f"No GGUF model found. Use --gpu-model <path>")
+            self.log.error("No GGUF model found")
             return False
         self.config.gpu_model = model
-
         self.log.info(f"Starting GPU: {os.path.basename(model)} on :{self.config.gpu_port}")
-
         env = os.environ.copy()
         if llama_lib:
             env["LD_LIBRARY_PATH"] = f"{llama_lib}:/opt/xilinx/xrt/lib:" + env.get("LD_LIBRARY_PATH", "")
-
         proc = subprocess.Popen(
-            [llama_bin,
-             "--model", model,
-             "--port", str(self.config.gpu_port),
-             "--ctx-size", str(self.config.gpu_ctx),
-             "--n-gpu-layers", str(self.config.gpu_layers),
-             "--threads", str(self.config.gpu_threads),
-             "--host", "0.0.0.0"],
+            [llama_bin, "--model", model, "--port", str(self.config.gpu_port),
+             "--ctx-size", str(self.config.gpu_ctx), "--n-gpu-layers", str(self.config.gpu_layers),
+             "--threads", str(self.config.gpu_threads), "--host", "0.0.0.0"],
             env=env,
             stdout=subprocess.DEVNULL if not self.config.verbose else None,
-            stderr=subprocess.DEVNULL if not self.config.verbose else None,
-        )
+            stderr=subprocess.DEVNULL if not self.config.verbose else None)
         self.procs.append(proc)
-
-        if self._wait_for_health(
-            f"http://127.0.0.1:{self.config.gpu_port}/health", timeout=120, check_text="ok"
-        ):
-            self.log.info(f"GPU ready ✓ (PID: {proc.pid})")
+        if self._wait_for_health(f"http://127.0.0.1:{self.config.gpu_port}/health", timeout=120, check_text="ok"):
+            self.log.info(f"GPU ready (PID: {proc.pid})")
             return True
-
-        self.log.error("llama-server failed to start — check Vulkan and GGUF model")
+        self.log.error("llama-server failed to start")
         return False
 
     def stop_all(self):
@@ -285,22 +226,28 @@ class ProcessManager:
 # Inference Engine
 # ═════════════════════════════════════════════════════════════════════════════
 
+def extract_text(content):
+    """Extract text from OpenAI content (string or list of objects)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return str(content)
+
+
+def clean_messages(messages):
+    """Normalize messages to plain string content."""
+    result = []
+    for m in messages:
+        result.append({"role": m.get("role", "user"), "content": extract_text(m.get("content", ""))})
+    return result
+
+
 class InferenceEngine:
-    """
-    Pipelined NPU+GPU inference engine.
-
-    Pipeline mode:
-      1. GPU starts warming KV cache in background
-      2. NPU streams draft tokens to user (fast TTFT)
-      3. GPU continues from NPU output (cache pre-warmed)
-
-    Both accelerators contribute to every response.
-    """
-
-    def __init__(self, config: PipelineConfig):
+    def __init__(self, config):
         self.config = config
         self.log = logging.getLogger("engine")
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session = None
 
     @property
     def draft_url(self):
@@ -311,13 +258,11 @@ class InferenceEngine:
         return f"http://127.0.0.1:{self.config.gpu_port}"
 
     async def start(self):
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180))
+        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600, sock_read=300))
 
     async def stop(self):
         if self._session:
             await self._session.close()
-
-    # ── NPU (FastFlowLM) ─────────────────────────────────────────────────
 
     def _patch_messages(self, messages):
         patched = []
@@ -332,7 +277,7 @@ class InferenceEngine:
             patched.insert(0, {"role": "system", "content": "You are a helpful assistant. /no_think"})
         return patched
 
-    async def _npu_stream(self, messages, max_tokens) -> AsyncIterator[str]:
+    async def _npu_stream(self, messages, max_tokens):
         payload = {"model": self.config.draft_model, "messages": self._patch_messages(messages),
                    "max_tokens": max_tokens, "temperature": self.config.temperature, "stream": True}
         async with self._session.post(f"{self.draft_url}/v1/chat/completions", json=payload) as resp:
@@ -361,16 +306,6 @@ class InferenceEngine:
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
 
-    async def _npu_collect(self, messages, max_tokens) -> str:
-        payload = {"model": self.config.draft_model, "messages": self._patch_messages(messages),
-                   "max_tokens": max_tokens, "temperature": self.config.temperature, "stream": False}
-        async with self._session.post(f"{self.draft_url}/v1/chat/completions", json=payload) as resp:
-            data = await resp.json()
-        text = data["choices"][0]["message"]["content"]
-        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-    # ── GPU (llama.cpp) ──────────────────────────────────────────────────
-
     def _build_prompt(self, messages, prefix=""):
         prompt = ""
         has_sys = False
@@ -388,7 +323,7 @@ class InferenceEngine:
         prompt += f"<|im_start|>assistant\n{prefix}"
         return prompt
 
-    async def _gpu_stream(self, messages, prefix, max_tokens) -> AsyncIterator[str]:
+    async def _gpu_stream(self, messages, prefix, max_tokens):
         payload = {"prompt": self._build_prompt(messages, prefix), "n_predict": max_tokens,
                    "temperature": self.config.temperature, "top_p": self.config.top_p,
                    "cache_prompt": True, "stream": True}
@@ -415,7 +350,6 @@ class InferenceEngine:
                     continue
 
     async def _gpu_warmup(self, messages):
-        """Pre-warm GPU KV cache with the prompt (generates 1 token)."""
         try:
             payload = {"prompt": self._build_prompt(messages), "n_predict": 1,
                        "temperature": 0.0, "cache_prompt": True, "stream": False}
@@ -424,47 +358,32 @@ class InferenceEngine:
         except Exception:
             pass
 
-    # ── Pipeline: NPU streams + GPU continues ────────────────────────────
-
-    async def pipeline_stream(self, messages, max_tokens) -> AsyncIterator[str]:
+    async def pipeline_stream(self, messages, max_tokens):
         cfg = self.config
         npu_tokens = min(max_tokens // 2, cfg.draft_tokens)
         gpu_tokens = max_tokens - npu_tokens
-
         t0 = time.perf_counter()
-
-        # Fire GPU warmup in background while NPU streams
         warmup_task = asyncio.create_task(self._gpu_warmup(messages))
-
-        # NPU streams to user — instant TTFT
         npu_text = ""
         async for chunk in self._npu_stream(messages, npu_tokens):
             npu_text += chunk
             yield chunk
-
         npu_ms = (time.perf_counter() - t0) * 1000
         if cfg.verbose:
             npu_words = len(npu_text.split())
             rate = npu_words / (npu_ms / 1000) if npu_ms > 0 else 0
             self.log.info(f"[NPU] {npu_words} words in {npu_ms:.0f}ms ({rate:.1f} w/s)")
-
-        # Ensure GPU warmup is done
         await warmup_task
-
-        # GPU continues from NPU output — cache is warm
         t1 = time.perf_counter()
         async for chunk in self._gpu_stream(messages, npu_text, gpu_tokens):
             yield chunk
-
         if cfg.verbose:
             gpu_ms = (time.perf_counter() - t1) * 1000
             total_ms = (time.perf_counter() - t0) * 1000
             self.log.info(f"[GPU] Continued in {gpu_ms:.0f}ms")
             self.log.info(f"[TOTAL] {total_ms:.0f}ms (NPU {npu_ms:.0f}ms + GPU {gpu_ms:.0f}ms)")
 
-    # ── Mode router ──────────────────────────────────────────────────────
-
-    async def generate(self, messages, max_tokens, mode=None) -> AsyncIterator[str]:
+    async def generate(self, messages, max_tokens, mode=None):
         mode = mode or self.config.mode
         if mode == "npu":
             async for c in self._npu_stream(messages, max_tokens):
@@ -486,7 +405,7 @@ class InferenceEngine:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# OpenAI-Compatible API Server
+# API Server — OpenAI + Ollama compatible
 # ═════════════════════════════════════════════════════════════════════════════
 
 CORS = {
@@ -496,12 +415,13 @@ CORS = {
     "Access-Control-Max-Age": "3600",
 }
 
+MODE_MAP = {"strix-speculative": "pipeline", "npu": "npu", "gpu": "gpu", "auto": "auto"}
+
 
 class APIServer:
-    def __init__(self, engine: InferenceEngine, config: PipelineConfig):
+    def __init__(self, engine, config):
         self.engine = engine
         self.config = config
-        self.log = logging.getLogger("api")
         self.app = web.Application()
         r = self.app.router
         r.add_route("OPTIONS", "/{path:.*}", self._options)
@@ -509,7 +429,20 @@ class APIServer:
         r.add_get("/health", self._health)
         r.add_get("/v1/health", self._health)
         r.add_get("/v1/models", self._models)
-        r.add_post("/v1/chat/completions", self._chat)
+        r.add_post("/v1/chat/completions", self._openai_chat)
+        # Ollama endpoints
+        r.add_post("/api/chat", self._ollama_chat)
+        r.add_get("/api/tags", self._ollama_tags)
+        r.add_get("/api/ps", self._ollama_ps)
+        r.add_get("/v1/api/tags", self._ollama_tags)
+        r.add_get("/v1/api/ps", self._ollama_ps)
+        r.add_get("/api/version", self._ollama_version)
+
+    def _resolve_mode(self, model_name):
+        clean = model_name.replace(":latest", "").strip()
+        return MODE_MAP.get(clean, "pipeline")
+
+    # ── Generic endpoints ─────────────────────────────────────────────
 
     async def _options(self, req):
         return web.Response(status=200, headers=CORS)
@@ -518,15 +451,12 @@ class APIServer:
         return web.json_response({
             "name": "Strix Halo NPU+GPU Pipeline",
             "version": __version__,
-            "accelerators": {
-                "npu": self.config.draft_model,
-                "gpu": os.path.basename(self.config.gpu_model),
-            },
-            "api": f"http://{self.config.host}:{self.config.port}/v1",
         }, headers=CORS)
 
     async def _health(self, req):
         return web.json_response({"status": "ok"}, headers=CORS)
+
+    # ── OpenAI format ─────────────────────────────────────────────────
 
     async def _models(self, req):
         return web.json_response({"object": "list", "data": [
@@ -536,18 +466,16 @@ class APIServer:
             {"id": "auto", "object": "model", "owned_by": "local"},
         ]}, headers=CORS)
 
-    async def _chat(self, req):
+    async def _openai_chat(self, req):
         body = await req.json()
-        messages = body.get("messages", [])
+        messages = clean_messages(body.get("messages", []))
         stream = body.get("stream", False)
-        max_tokens = body.get("max_tokens", 512)
+        max_tokens = body.get("max_tokens", 2048)
         model = body.get("model", "strix-speculative")
+        mode = self._resolve_mode(model)
 
         if body.get("temperature") is not None:
             self.engine.config.temperature = body["temperature"]
-
-        mode = {"strix-speculative": "pipeline", "npu": "npu",
-                "gpu": "gpu", "auto": "auto"}.get(model, "pipeline")
 
         rid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         ts = int(time.time())
@@ -558,11 +486,25 @@ class APIServer:
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive", **CORS})
             await resp.prepare(req)
-            async for chunk in self.engine.generate(messages, max_tokens, mode):
-                sse = {"id": rid, "object": "chat.completion.chunk", "created": ts,
-                       "model": model, "choices": [{"index": 0,
-                       "delta": {"content": chunk}, "finish_reason": None}]}
-                await resp.write(f"data: {json.dumps(sse)}\n\n".encode())
+
+            async def heartbeat():
+                while True:
+                    await asyncio.sleep(5)
+                    try:
+                        await resp.write(b": heartbeat\n\n")
+                    except Exception:
+                        break
+
+            hb = asyncio.create_task(heartbeat())
+            try:
+                async for chunk in self.engine.generate(messages, max_tokens, mode):
+                    sse = {"id": rid, "object": "chat.completion.chunk", "created": ts,
+                           "model": model, "choices": [{"index": 0,
+                           "delta": {"content": chunk}, "finish_reason": None}]}
+                    await resp.write(f"data: {json.dumps(sse)}\n\n".encode())
+            finally:
+                hb.cancel()
+
             final = {"id": rid, "object": "chat.completion.chunk", "created": ts,
                      "model": model, "choices": [{"index": 0, "delta": {},
                      "finish_reason": "stop"}]}
@@ -584,6 +526,80 @@ class APIServer:
                 "timings": {"total_ms": round(ms, 1)},
             }, headers=CORS)
 
+    # ── Ollama format (Open WebUI uses this) ──────────────────────────
+
+    async def _ollama_chat(self, req):
+        body = await req.json()
+        messages = clean_messages(body.get("messages", []))
+        stream = body.get("stream", True)
+        model = body.get("model", "strix-speculative")
+        mode = self._resolve_mode(model)
+        opts = body.get("options", {})
+        max_tokens = opts.get("num_predict", 2048)
+
+        if opts.get("temperature") is not None:
+            self.engine.config.temperature = opts["temperature"]
+
+        if stream:
+            resp = web.StreamResponse(headers={
+                "Content-Type": "application/x-ndjson",
+                "Cache-Control": "no-cache", **CORS})
+            await resp.prepare(req)
+
+            full_text = ""
+            async for chunk in self.engine.generate(messages, max_tokens, mode):
+                full_text += chunk
+                msg = {
+                    "model": model,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "message": {"role": "assistant", "content": chunk},
+                    "done": False,
+                }
+                await resp.write(json.dumps(msg).encode() + b"\n")
+
+            done_msg = {
+                "model": model,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "total_duration": 0,
+                "eval_count": len(full_text.split()),
+            }
+            await resp.write(json.dumps(done_msg).encode() + b"\n")
+            return resp
+        else:
+            full_text = ""
+            async for chunk in self.engine.generate(messages, max_tokens, mode):
+                full_text += chunk
+            return web.json_response({
+                "model": model,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "message": {"role": "assistant", "content": full_text},
+                "done": True,
+                "eval_count": len(full_text.split()),
+            }, headers=CORS)
+
+    async def _ollama_tags(self, req):
+        models = []
+        for name in ["strix-speculative", "npu", "gpu", "auto"]:
+            models.append({
+                "name": name, "model": name, "size": 0, "digest": "",
+                "modified_at": "2026-03-18T00:00:00Z",
+                "details": {"family": "qwen", "format": "hybrid",
+                            "parameter_size": "8B", "quantization_level": "Q4_K_M"},
+            })
+        return web.json_response({"models": models}, headers=CORS)
+
+    async def _ollama_ps(self, req):
+        return web.json_response({"models": [{
+            "name": "strix-speculative", "model": "strix-speculative",
+            "size": 0, "digest": "",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }]}, headers=CORS)
+
+    async def _ollama_version(self, req):
+        return web.json_response({"version": __version__}, headers=CORS)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Main
@@ -591,32 +607,22 @@ class APIServer:
 
 BANNER = """
 \033[1;32m
-  ╔═══════════════════════════════════════════════════════════╗
-  ║      STRIX HALO NPU+GPU LLM PIPELINE — v{version}          ║
-  ╠═══════════════════════════════════════════════════════════╣
-  ║                                                           ║
-  ║  NPU:  {npu:<20s} :{npu_port}  (XDNA2, FLM)       ║
-  ║  GPU:  {gpu:<20s} :{gpu_port}  (RDNA 3.5, Vulkan)  ║
-  ║  NPU pmode: {pmode:<10s}                                  ║
-  ║                                                           ║
-  ║  API:  http://{ip}:{api_port}/v1                     ║
-  ║                                                           ║
-  ║  Models:                                                  ║
-  ║    strix-speculative → NPU streams + GPU continues        ║
-  ║    npu               → NPU only (fast, low power)         ║
-  ║    gpu               → GPU only (high quality)            ║
-  ║    auto              → Smart routing                      ║
-  ║                                                           ║
-  ║  Open WebUI: Settings → Connections → Add                 ║
-  ║    URL: http://{ip}:{api_port}/v1                    ║
-  ║    Key: anything                                          ║
-  ║                                                           ║
-  ║  Ctrl+C to stop                                           ║
-  ╚═══════════════════════════════════════════════════════════╝
+  ======================================================
+   STRIX HALO NPU+GPU LLM PIPELINE  v{version}
+  ======================================================
+   NPU:   {npu:<20s} :{npu_port}  (XDNA2, pmode={pmode})
+   GPU:   {gpu:<20s} :{gpu_port}  (RDNA 3.5, Vulkan)
+
+   API:   http://{ip}:{api_port}/v1     (OpenAI)
+          http://{ip}:{api_port}        (Ollama)
+
+   Models: strix-speculative | npu | gpu | auto
+   Ctrl+C to stop
+  ======================================================
 \033[0m"""
 
 
-async def run_server(config: PipelineConfig):
+async def run_server(config):
     engine = InferenceEngine(config)
     await engine.start()
     server = APIServer(engine, config)
@@ -632,15 +638,9 @@ async def run_server(config: PipelineConfig):
         ip = "127.0.0.1"
 
     print(BANNER.format(
-        version=__version__,
-        npu=config.draft_model,
-        npu_port=config.draft_port,
-        gpu=os.path.basename(config.gpu_model)[:20],
-        gpu_port=config.gpu_port,
-        pmode=config.draft_pmode,
-        ip=ip,
-        api_port=config.port,
-    ))
+        version=__version__, npu=config.draft_model, npu_port=config.draft_port,
+        gpu=os.path.basename(config.gpu_model)[:20], gpu_port=config.gpu_port,
+        pmode=config.draft_pmode, ip=ip, api_port=config.port))
 
     try:
         while True:
@@ -657,80 +657,51 @@ def main():
         description="Strix Halo NPU+GPU LLM Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s --gpu-model ./models/Qwen3-8B-Q4_K_M.gguf
-  %(prog)s --gpu-model ./models/Qwen3.5-27B-Q4_K_M.gguf --draft qwen3:4b --pmode turbo
-  %(prog)s --gpu-model ./models/Qwen3-8B-Q4_K_M.gguf --draft qwen3:1.7b --draft-tokens 64 -v
-
 Recommended configurations:
-  Fast + smart:   --draft qwen3:4b --gpu-model Qwen3-8B   --draft-tokens 64
+  Fast + smart:   --draft qwen3:4b  --gpu-model Qwen3-8B    --draft-tokens 64
   Max quality:    --draft qwen3:1.7b --gpu-model Qwen3.5-27B --draft-tokens 32
-  Best balance:   --draft qwen3:4b --gpu-model Qwen3.5-27B --draft-tokens 32
-
-Then connect Open WebUI to: http://<your-ip>:11435/v1
-        """,
-    )
-    parser.add_argument("--gpu-model", required=True, help="Path to GGUF model for GPU")
-    parser.add_argument("--draft", default="qwen3:1.7b", help="FLM draft model (default: qwen3:1.7b)")
+  Best balance:   --draft qwen3:4b  --gpu-model Qwen3.5-27B --draft-tokens 32
+        """)
+    parser.add_argument("--gpu-model", required=True, help="GGUF model for GPU")
+    parser.add_argument("--draft", default="qwen3:1.7b", help="FLM draft model")
     parser.add_argument("--pmode", default="performance",
                         choices=["powersaver", "balanced", "performance", "turbo"],
                         help="NPU power mode (default: performance)")
-    parser.add_argument("--draft-tokens", type=int, default=128, help="NPU draft length (default: 128)")
-    parser.add_argument("--draft-port", type=int, default=52625, help="FLM server port")
-    parser.add_argument("--gpu-port", type=int, default=9999, help="llama.cpp server port")
+    parser.add_argument("--draft-tokens", type=int, default=128, help="NPU draft length")
+    parser.add_argument("--draft-port", type=int, default=52625)
+    parser.add_argument("--gpu-port", type=int, default=9999)
     parser.add_argument("--gpu-ctx", type=int, default=4096, help="GPU context size")
-    parser.add_argument("--gpu-layers", type=int, default=99, help="GPU layers to offload")
-    parser.add_argument("--port", type=int, default=11435, help="API server port (default: 11435)")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--gpu-layers", type=int, default=99)
+    parser.add_argument("--port", type=int, default=11435, help="API port")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--mode", choices=["pipeline", "npu", "gpu", "auto"], default="pipeline")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Show timing stats")
-    parser.add_argument("--no-launch", action="store_true",
-                        help="Don't start FLM/llama.cpp (assume already running)")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--no-launch", action="store_true", help="Don't start servers")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
     log = logging.getLogger("main")
 
     config = PipelineConfig(
-        draft_model=args.draft,
-        draft_pmode=args.pmode,
-        draft_port=args.draft_port,
-        gpu_model=args.gpu_model,
-        gpu_port=args.gpu_port,
-        gpu_ctx=args.gpu_ctx,
-        gpu_layers=args.gpu_layers,
-        port=args.port,
-        host=args.host,
-        draft_tokens=args.draft_tokens,
-        temperature=args.temperature,
-        mode=args.mode,
-        verbose=args.verbose,
-    )
+        draft_model=args.draft, draft_pmode=args.pmode, draft_port=args.draft_port,
+        gpu_model=args.gpu_model, gpu_port=args.gpu_port, gpu_ctx=args.gpu_ctx,
+        gpu_layers=args.gpu_layers, port=args.port, host=args.host,
+        draft_tokens=args.draft_tokens, temperature=args.temperature,
+        mode=args.mode, verbose=args.verbose)
 
-    # Setup environment
     env = Environment(log)
     env.setup_all()
 
     proc_mgr = None
-
     if not args.no_launch:
         proc_mgr = ProcessManager(config, log)
-
-        # Start FLM (NPU)
         if not proc_mgr.start_flm():
-            log.error("Failed to start NPU server")
             proc_mgr.stop_all()
             sys.exit(1)
-
-        # Start llama.cpp (GPU)
         if not proc_mgr.start_llama():
-            log.error("Failed to start GPU server")
             proc_mgr.stop_all()
             sys.exit(1)
 
