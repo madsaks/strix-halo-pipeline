@@ -177,6 +177,7 @@ python3 strix_halo_pipeline.py --help
 
   --gpu-model PATH    GGUF model for GPU (required)
   --draft MODEL       FLM draft model (default: qwen3:1.7b)
+  --pmode MODE        NPU power mode: powersaver|balanced|performance|turbo
   --draft-tokens N    NPU tokens per round (default: 128)
   --gpu-ctx N         GPU context size (default: 4096)
   --gpu-layers N      Layers on GPU (default: 99 = all)

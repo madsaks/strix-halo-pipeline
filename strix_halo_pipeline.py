@@ -10,8 +10,8 @@ a larger model. Both accelerators share 128GB unified LPDDR5X via GPUVM.
 
 Usage:
     python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3-8B-Q4_K_M.gguf
-    python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3-14B-Q4_K_M.gguf --draft qwen3:4b
-    python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3-32B-Q4_K_M.gguf --draft qwen3:4b -v
+    python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3.5-27B-Q4_K_M.gguf --draft qwen3:4b
+    python3 strix_halo_pipeline.py --gpu-model ./models/Qwen3-8B-Q4_K_M.gguf --pmode turbo -v
 
 Connect any OpenAI-compatible client to: http://<your-ip>:11435/v1
 
@@ -19,7 +19,7 @@ Author:  Mike Alani / Claude collaboration
 License: MIT
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import asyncio
@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
@@ -48,6 +48,7 @@ except ImportError:
     import aiohttp
     from aiohttp import web
 
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═════════════════════════════════════════════════════════════════════════════
@@ -56,6 +57,7 @@ except ImportError:
 class PipelineConfig:
     # Draft model (NPU via FastFlowLM)
     draft_model: str = "qwen3:1.7b"
+    draft_pmode: str = "performance"
     draft_port: int = 52625
 
     # Verifier model (GPU via llama.cpp)
@@ -107,7 +109,7 @@ class Environment:
                         os.symlink(f, link)
                 self.log.info("Created XRT symlinks")
             except PermissionError:
-                self.log.warning("Cannot create XRT symlinks — run with sudo once, or:")
+                self.log.warning("Cannot create XRT symlinks — run once with:")
                 self.log.warning(f"  sudo mkdir -p {target}")
                 self.log.warning(f"  sudo bash -c 'for f in {source}/*.so*; "
                                  f"do ln -sf \"$f\" {target}/$(basename \"$f\"); done'")
@@ -118,7 +120,7 @@ class Environment:
             try:
                 with open(card, "w") as f:
                     f.write("performance")
-                self.log.info(f"GPU performance mode set")
+                self.log.info("GPU performance mode set")
             except PermissionError:
                 pass
 
@@ -176,8 +178,8 @@ class ProcessManager:
     def __init__(self, config: PipelineConfig, log: logging.Logger):
         self.config = config
         self.log = log
-        self.procs: list[subprocess.Popen] = []
         self.env = Environment(log)
+        self.procs: list[subprocess.Popen] = []
 
     def _wait_for_health(self, url: str, timeout: int = 120, check_text: str = ""):
         """Poll a URL until it responds."""
@@ -207,10 +209,12 @@ class ProcessManager:
         if not self.env.check_npu():
             self.log.warning("NPU device /dev/accel/accel0 not found")
 
-        self.log.info(f"Starting NPU server: {self.config.draft_model} on :{self.config.draft_port}")
+        self.log.info(f"Starting NPU: {self.config.draft_model} (pmode={self.config.draft_pmode}) on :{self.config.draft_port}")
 
         proc = subprocess.Popen(
-            [flm_bin, "serve", self.config.draft_model, "--port", str(self.config.draft_port)],
+            [flm_bin, "serve", self.config.draft_model,
+             "--pmode", self.config.draft_pmode,
+             "--port", str(self.config.draft_port)],
             stdout=subprocess.DEVNULL if not self.config.verbose else None,
             stderr=subprocess.DEVNULL if not self.config.verbose else None,
         )
@@ -238,7 +242,7 @@ class ProcessManager:
             return False
         self.config.gpu_model = model
 
-        self.log.info(f"Starting GPU server: {os.path.basename(model)} on :{self.config.gpu_port}")
+        self.log.info(f"Starting GPU: {os.path.basename(model)} on :{self.config.gpu_port}")
 
         env = os.environ.copy()
         if llama_lib:
@@ -335,12 +339,13 @@ class InferenceEngine:
             in_think = False
             async for line in resp.content:
                 line = line.decode("utf-8").strip()
-                if not line.startswith("data: ") or line[6:].strip() == "[DONE]":
-                    if line[6:].strip() == "[DONE]" if line.startswith("data: ") else False:
-                        break
+                if not line.startswith("data: "):
                     continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
                 try:
-                    delta = json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+                    delta = json.loads(data_str)["choices"][0]["delta"].get("content", "")
                     if not delta:
                         continue
                     if "<think>" in delta:
@@ -390,10 +395,13 @@ class InferenceEngine:
         async with self._session.post(f"{self.gpu_url}/completion", json=payload) as resp:
             async for line in resp.content:
                 line = line.decode("utf-8").strip()
-                if not line.startswith("data: ") or line[6:].strip() == "[DONE]":
+                if not line.startswith("data: "):
                     continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
                 try:
-                    token = json.loads(line[6:]).get("content", "")
+                    token = json.loads(data_str).get("content", "")
                     if not token:
                         continue
                     for eos in ["<|im_end|>", "<|endoftext|>", "</s>"]:
@@ -436,8 +444,9 @@ class InferenceEngine:
 
         npu_ms = (time.perf_counter() - t0) * 1000
         if cfg.verbose:
-            self.log.info(f"[NPU] {len(npu_text.split())} words in {npu_ms:.0f}ms "
-                          f"({len(npu_text.split()) / (npu_ms / 1000):.1f} w/s)")
+            npu_words = len(npu_text.split())
+            rate = npu_words / (npu_ms / 1000) if npu_ms > 0 else 0
+            self.log.info(f"[NPU] {npu_words} words in {npu_ms:.0f}ms ({rate:.1f} w/s)")
 
         # Ensure GPU warmup is done
         await warmup_task
@@ -487,6 +496,7 @@ CORS = {
     "Access-Control-Max-Age": "3600",
 }
 
+
 class APIServer:
     def __init__(self, engine: InferenceEngine, config: PipelineConfig):
         self.engine = engine
@@ -508,7 +518,10 @@ class APIServer:
         return web.json_response({
             "name": "Strix Halo NPU+GPU Pipeline",
             "version": __version__,
-            "accelerators": {"npu": self.config.draft_model, "gpu": os.path.basename(self.config.gpu_model)},
+            "accelerators": {
+                "npu": self.config.draft_model,
+                "gpu": os.path.basename(self.config.gpu_model),
+            },
             "api": f"http://{self.config.host}:{self.config.port}/v1",
         }, headers=CORS)
 
@@ -550,7 +563,10 @@ class APIServer:
                        "model": model, "choices": [{"index": 0,
                        "delta": {"content": chunk}, "finish_reason": None}]}
                 await resp.write(f"data: {json.dumps(sse)}\n\n".encode())
-            await resp.write(f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode())
+            final = {"id": rid, "object": "chat.completion.chunk", "created": ts,
+                     "model": model, "choices": [{"index": 0, "delta": {},
+                     "finish_reason": "stop"}]}
+            await resp.write(f"data: {json.dumps(final)}\n\n".encode())
             await resp.write(b"data: [DONE]\n\n")
             return resp
         else:
@@ -581,6 +597,7 @@ BANNER = """
   ║                                                           ║
   ║  NPU:  {npu:<20s} :{npu_port}  (XDNA2, FLM)       ║
   ║  GPU:  {gpu:<20s} :{gpu_port}  (RDNA 3.5, Vulkan)  ║
+  ║  NPU pmode: {pmode:<10s}                                  ║
   ║                                                           ║
   ║  API:  http://{ip}:{api_port}/v1                     ║
   ║                                                           ║
@@ -620,6 +637,7 @@ async def run_server(config: PipelineConfig):
         npu_port=config.draft_port,
         gpu=os.path.basename(config.gpu_model)[:20],
         gpu_port=config.gpu_port,
+        pmode=config.draft_pmode,
         ip=ip,
         api_port=config.port,
     ))
@@ -641,14 +659,22 @@ def main():
         epilog="""
 Examples:
   %(prog)s --gpu-model ./models/Qwen3-8B-Q4_K_M.gguf
-  %(prog)s --gpu-model ./models/Qwen3-14B-Q4_K_M.gguf --draft qwen3:4b
-  %(prog)s --gpu-model ./models/Qwen3-32B-Q4_K_M.gguf --draft qwen3:4b --draft-tokens 64 -v
+  %(prog)s --gpu-model ./models/Qwen3.5-27B-Q4_K_M.gguf --draft qwen3:4b --pmode turbo
+  %(prog)s --gpu-model ./models/Qwen3-8B-Q4_K_M.gguf --draft qwen3:1.7b --draft-tokens 64 -v
+
+Recommended configurations:
+  Fast + smart:   --draft qwen3:4b --gpu-model Qwen3-8B   --draft-tokens 64
+  Max quality:    --draft qwen3:1.7b --gpu-model Qwen3.5-27B --draft-tokens 32
+  Best balance:   --draft qwen3:4b --gpu-model Qwen3.5-27B --draft-tokens 32
 
 Then connect Open WebUI to: http://<your-ip>:11435/v1
         """,
     )
     parser.add_argument("--gpu-model", required=True, help="Path to GGUF model for GPU")
     parser.add_argument("--draft", default="qwen3:1.7b", help="FLM draft model (default: qwen3:1.7b)")
+    parser.add_argument("--pmode", default="performance",
+                        choices=["powersaver", "balanced", "performance", "turbo"],
+                        help="NPU power mode (default: performance)")
     parser.add_argument("--draft-tokens", type=int, default=128, help="NPU draft length (default: 128)")
     parser.add_argument("--draft-port", type=int, default=52625, help="FLM server port")
     parser.add_argument("--gpu-port", type=int, default=9999, help="llama.cpp server port")
@@ -673,6 +699,7 @@ Then connect Open WebUI to: http://<your-ip>:11435/v1
 
     config = PipelineConfig(
         draft_model=args.draft,
+        draft_pmode=args.pmode,
         draft_port=args.draft_port,
         gpu_model=args.gpu_model,
         gpu_port=args.gpu_port,
@@ -693,11 +720,6 @@ Then connect Open WebUI to: http://<your-ip>:11435/v1
     proc_mgr = None
 
     if not args.no_launch:
-        # Kill any leftover processes
-        for pattern in ["flm serve", f"llama-server.*{config.gpu_port}", "strix_halo_pipeline"]:
-            subprocess.run(["pkill", "-f", pattern], capture_output=True)
-        time.sleep(1)
-
         proc_mgr = ProcessManager(config, log)
 
         # Start FLM (NPU)
