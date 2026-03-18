@@ -81,7 +81,7 @@ The pipeline gives you **NPU-like TTFT** with **GPU-quality output**. Scale up t
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/strix-halo-pipeline.git
+git clone https://github.com/mikealanni/strix-halo-pipeline.git
 cd strix-halo-pipeline
 
 # Install Python dependencies
@@ -240,7 +240,7 @@ What IS parallel:
 
 ## Credits
 
-Built by [Mike Alani](https://github.com/YOUR_USERNAME) with Claude assistance.
+Built by [Mike Alani](https://github.com/mikealanni) with Claude assistance.
 First demonstrated on Ryzen AI Max+ 395 (Strix Halo), March 17, 2026.
 
 ## License
