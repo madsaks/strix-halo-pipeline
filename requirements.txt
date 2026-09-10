@@ -1,0 +1,10 @@
+# Install these into the container image rather than letting the script's
+# import-time fallback pip-install them: a model-serving process should not
+# mutate its Python environment on startup.
+#
+#   /usr/bin/python3 -m pip install -r requirements.txt
+#
+# Both are already present under /usr/bin/python3 in the strix-pipeline
+# distrobox. The versions below are what the measurements were taken with.
+aiohttp>=3.13
+PyYAML>=6.0
