@@ -31,7 +31,7 @@ cases = [
     (["<|chan", "nel>thought\n", "<chann", "el|>", "done"], "done"),
     (["a<th", "ink>x</th", "ink>b"], "ab"),
     (["answer <chan"], "answer <chan"),
-    (["<think>never closed"], ""),
+    (["<think>never closed"], "never closed"),   # released, not swallowed
     (["...inference.<channel|>"], "...inference."),
     (["if a < b and c > d"], "if a < b and c > d"),
     ([c for c in "<|channel>thought\n<channel|>The sky is blue."],
@@ -60,7 +60,46 @@ for chunks, want in cases:
     label = repr(chunks) if len(repr(chunks)) < 60 else repr(chunks)[:57] + "...]"
     print(("PASS " if ok else "FAIL ") + label + " -> " + repr(got)
           + ("" if ok else "  WANT " + repr(want)))
-total = len(cases) + len(eos_cases)
+
+# an unterminated region is flagged as well as released
+san = S()
+san.feed("<think>cut off mid-thought")
+released = san.flush()
+ok = released == "cut off mid-thought" and san.unterminated
+fails += 0 if ok else 1
+print(("PASS " if ok else "FAIL ") + "unterminated region released and flagged"
+      + " -> " + repr(released) + " unterminated=" + str(san.unterminated))
+
+# a closed region leaves the flag clear
+san = S()
+out = san.feed("<think>x</think>answer") + san.flush()
+ok = out == "answer" and not san.unterminated
+fails += 0 if ok else 1
+print(("PASS " if ok else "FAIL ") + "closed region leaves flag clear -> "
+      + repr(out) + " unterminated=" + str(san.unterminated))
+
+# ── Marker profiles ──────────────────────────────────────────────────────────
+# A narrow profile must not fire on another family's markers: quoting ChatML in
+# a Gemma 4 answer is legitimate text, not the end of the turn.
+prof_cases = [
+    ("gemma4", "Use <|im_start|>user for ChatML.", "Use <|im_start|>user for ChatML.", False),
+    ("gemma4", "Answer<turn|>junk", "Answer", True),
+    ("chatml", "Gemma 4 opens with <|turn>model.", "Gemma 4 opens with <|turn>model.", False),
+    ("chatml", "Answer<|im_end|>junk", "Answer", True),
+    ("gemma", "No channel here <channel|> stays", "No channel here <channel|> stays", False),
+    ("gemma", "Answer<end_of_turn>junk", "Answer", True),
+    # the catch-all still recognises everything
+    ("generic", "Answer<turn|>junk", "Answer", True),
+    ("generic", "Answer<|im_end|>junk", "Answer", True),
+]
+for prof, text, want, want_stop in prof_cases:
+    san = S(m.MARKER_PROFILES[prof])
+    got = san.feed(text) + san.flush()
+    ok = got == want and san.stopped == want_stop
+    fails += 0 if ok else 1
+    print(("PASS " if ok else "FAIL ") + "profile %-8s %r -> %r stopped=%s"
+          % (prof, text[:34], got[:40], san.stopped)
+          + ("" if ok else "  WANT " + repr(want)))
 
 # ── Prompt templates ─────────────────────────────────────────────────────────
 # Expected strings are what llama-server's /apply-template produced from the
@@ -108,6 +147,10 @@ dispatch = [
     ("/models/gemma4-31b.gguf", "auto", "gemma4"),
     ("/models/qwen3-8b-Q4.gguf", "auto", "chatml"),
     ("/models/gemma-3-4b.gguf", "auto", "chatml"),   # gemma 2/3 not implemented
+    ("/models/gemma-4b-it-qat-Q4_K_M.gguf", "auto", "chatml"),  # 4B, not Gemma 4
+    ("/models/gemma4b.gguf", "auto", "chatml"),
+    ("/models/gemma-4-27b.gguf", "auto", "gemma4"),
+    ("/models/gemma_4_it.gguf", "auto", "gemma4"),
     (GEMMA, "chatml", "chatml"),                     # explicit override wins
 ]
 for model, tpl, want in dispatch:
@@ -169,7 +212,38 @@ same = draft_engine("gemma3:1b")._patch_messages(NO_SYS) is NO_SYS
 fails += 0 if same else 1
 print(("PASS " if same else "FAIL ") + "non-Qwen draft leaves messages unmodified")
 
-total = (len(cases) + len(eos_cases) + len(tpl_cases) + len(dispatch) + 1
-         + len(nothink_cases) + 1)
+# ── Draft-model profile selection ────────────────────────────────────────────
+draft_cases = [
+    ("qwen3:1.7b", "chatml"),
+    ("gemma3:1b", "gemma"),
+    ("gemma4-it:e2b", "gemma4"),
+    ("llama3.2:1b", "generic"),
+    ("phi4-mini-it:4b", "generic"),
+]
+for model, want in draft_cases:
+    got = m.draft_profile_name(model)
+    ok = got == want
+    fails += 0 if ok else 1
+    print(("PASS " if ok else "FAIL ") + "draft profile %-16s -> %s" % (model, got)
+          + ("" if ok else "  WANT " + want))
+
+# ── Config validation ────────────────────────────────────────────────────────
+try:
+    m.PipelineConfig(gpu_template="chatlm")
+    print("FAIL rejects unknown gpu_template (no error raised)")
+    fails += 1
+except ValueError:
+    print("PASS rejects unknown gpu_template")
+ok_cfg = True
+try:
+    for good in ("auto", "gemma4", "chatml"):
+        m.PipelineConfig(gpu_template=good)
+except ValueError:
+    ok_cfg = False
+fails += 0 if ok_cfg else 1
+print(("PASS " if ok_cfg else "FAIL ") + "accepts auto/gemma4/chatml")
+
+total = (len(cases) + len(eos_cases) + 2 + len(prof_cases) + len(tpl_cases)
+         + len(dispatch) + 1 + len(nothink_cases) + 1 + len(draft_cases) + 2)
 print("\n%d/%d passed" % (total - fails, total))
 sys.exit(1 if fails else 0)

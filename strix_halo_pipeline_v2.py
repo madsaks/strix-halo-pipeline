@@ -122,6 +122,13 @@ class PipelineConfig:
     kv_cache_ttl: float = 300.0            # seconds
     kv_cache_max_entries: int = 100
 
+    def __post_init__(self):
+        allowed = ("auto",) + GPU_TEMPLATES
+        if self.gpu_template not in allowed:
+            raise ValueError(
+                f"gpu_template must be one of {', '.join(allowed)}, "
+                f"got {self.gpu_template!r}")
+
     @classmethod
     def from_yaml(cls, path: str) -> "PipelineConfig":
         if not _HAS_YAML:
@@ -358,29 +365,58 @@ class KVCacheManager:
 # Control-token sanitizer
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Tokens that end a turn. Both backends are driven through raw-completion or
-# streaming APIs that hand back the model's control tokens as ordinary text,
-# so each family's terminators have to be recognised explicitly.
-EOS_TOKENS = ("<|im_end|>", "<|endoftext|>", "</s>",
-              "<turn|>", "<end_of_turn>", "<eos>")
+# Control markers, per prompt format.
+#
+# Both backends are driven through raw-completion or streaming APIs that hand
+# back the model's control tokens as ordinary text, so each family's markers
+# have to be recognised explicitly:
+#
+#   stop        end of the response. A turn-opener counts too — the model has
+#               moved past its own answer into an invented next turn.
+#   hide_open   opens a reasoning region; everything after it is suppressed
+#               until the matching close marker.
+#   hide_close  closes one. Also dropped on its own: the QAT Gemma4 build emits
+#               a bare "<channel|>" before the answer when it does no thinking
+#               pass, and "<|channel>thought\n<channel|>" when it does.
+#
+# Keep each profile to the markers its own family actually emits. A stop marker
+# the active model never produces can still truncate a legitimate answer that
+# merely quotes it — asking the model to explain ChatML should not cut the reply
+# off at the first "<|im_start|>".
+MARKER_PROFILES = {
+    "chatml": {
+        "stop": ("<|im_end|>", "<|im_start|>", "<|endoftext|>", "</s>"),
+        "hide_open": ("<think>",),
+        "hide_close": ("</think>",),
+    },
+    "gemma4": {
+        "stop": ("<turn|>", "<|turn>", "<eos>", "</s>"),
+        "hide_open": ("<|channel>",),
+        "hide_close": ("<channel|>",),
+    },
+    # Gemma 2/3: turn markers, no reasoning channel.
+    "gemma": {
+        "stop": ("<end_of_turn>", "<start_of_turn>", "<eos>", "</s>"),
+        "hide_open": (),
+        "hide_close": (),
+    },
+}
 
-# Handed to llama.cpp as server-side stop strings. The raw /completion endpoint
-# tokenizes the prompt without special-token parsing, so the model emits turn
-# markers as ordinary text and never trips a real EOS. Left to itself it keeps
-# going and invents entire conversation turns until n_predict runs out — which
-# is exactly what happens once a draft prefix has already answered the question.
-GPU_STOP_STRINGS = list(EOS_TOKENS) + ["<|im_start|>", "<|turn>",
-                                       "<start_of_turn>"]
+# Used when the model family cannot be identified: recognise everything, and
+# accept the truncation risk that comes with it.
+MARKER_PROFILES["generic"] = {
+    key: tuple(dict.fromkeys(
+        marker for prof in MARKER_PROFILES.values() for marker in prof[key]))
+    for key in ("stop", "hide_open", "hide_close")
+}
 
-# Markers that open a hidden region: everything after one is suppressed until
-# the matching close marker.
-_HIDE_OPEN = ("<think>", "<|channel>")
+# Template names that _resolve_template may return, and that gpu_template
+# accepts alongside "auto".
+GPU_TEMPLATES = ("gemma4", "chatml")
 
-# Markers that close a hidden region. They are also dropped when they appear
-# on their own — the QAT Gemma4 build normally emits "<|channel>thought\n"
-# immediately followed by "<channel|>" with nothing in between, but it also
-# emits a bare "<channel|>" before the answer when it does no thinking pass.
-_HIDE_CLOSE = ("</think>", "<channel|>")
+# Gemma 4 is its own format; "gemma-4" as a substring would also match a Gemma
+# 1/3 4B file such as gemma-4b-it.gguf, so the digit needs a boundary after it.
+_GEMMA4_RE = re.compile(r"gemma[-_ ]?4(?![a-z0-9])")
 
 # Qwen 3 switches its reasoning pass off via a "/no_think" directive in the
 # system prompt. That is a Qwen convention, not a general one — every other
@@ -392,13 +428,16 @@ def wants_no_think(model: str) -> bool:
     return model.strip().lower().startswith(_NO_THINK_PREFIXES)
 
 
-# A turn-opener in the output means the model has moved past its own answer
-# into an invented next turn, so it terminates the response just as an
-# end-of-turn marker does.
-_STOP_MARKERS = tuple(GPU_STOP_STRINGS)
-
-_ALL_MARKERS = _HIDE_OPEN + _HIDE_CLOSE + _STOP_MARKERS
-_MAX_MARKER = max(len(m) for m in _ALL_MARKERS)
+def draft_profile_name(model: str) -> str:
+    """Marker profile for a FastFlowLM draft model, by name."""
+    name = model.strip().lower()
+    if name.startswith(_NO_THINK_PREFIXES):
+        return "chatml"
+    if _GEMMA4_RE.search(name):
+        return "gemma4"
+    if name.startswith("gemma"):
+        return "gemma"
+    return "generic"
 
 
 class StreamSanitizer:
@@ -415,18 +454,36 @@ class StreamSanitizer:
     A marker can straddle a chunk boundary, so any suffix that could still grow
     into a marker is held back rather than emitted; call flush() once the
     stream ends to release whatever is left.
+
+    Pass the MARKER_PROFILES entry for the format actually in use. The default
+    recognises every family's markers, which is safe but over-eager: it will
+    also fire on a marker the model was merely quoting.
     """
 
-    def __init__(self):
+    def __init__(self, profile: Optional[dict] = None):
+        prof = profile or MARKER_PROFILES["generic"]
+        self._stop = tuple(prof["stop"])
+        self._open = tuple(prof["hide_open"])
+        self._close = tuple(prof["hide_close"])
+        self._markers = self._stop + self._open + self._close
+        self._max_marker = max((len(m) for m in self._markers), default=1)
         self._buf = ""
+        # Suppressed text is kept rather than dropped on the spot, so that a
+        # region which never closes can still be released by flush().
+        self._hidden_buf = ""
         self._hidden = False
         self.stopped = False
+        # Set when the stream ended inside a reasoning region. The region's
+        # text is still returned by flush() — a truncated thought is poor
+        # output, but an empty 200 response is worse — and the caller is
+        # expected to log it.
+        self.unterminated = False
 
     def _held_len(self) -> int:
         """Length of the trailing run that might still become a marker."""
-        for n in range(min(len(self._buf), _MAX_MARKER - 1), 0, -1):
+        for n in range(min(len(self._buf), self._max_marker - 1), 0, -1):
             tail = self._buf[-n:]
-            if any(m.startswith(tail) for m in _ALL_MARKERS):
+            if any(m.startswith(tail) for m in self._markers):
                 return n
         return 0
 
@@ -437,33 +494,52 @@ class StreamSanitizer:
         out = []
         while True:
             hit, pos = None, len(self._buf)
-            for m in _ALL_MARKERS:
+            for m in self._markers:
                 i = self._buf.find(m)
                 if i != -1 and i < pos:
                     hit, pos = m, i
             if hit is None:
                 break
-            if not self._hidden:
+            if self._hidden:
+                self._hidden_buf += self._buf[:pos]
+            else:
                 out.append(self._buf[:pos])
-            if hit in _STOP_MARKERS:
+            if hit in self._stop:
                 # End of turn: nothing after it belongs to this response.
                 self.stopped = True
                 self._buf = ""
                 return "".join(out)
             self._buf = self._buf[pos + len(hit):]
-            self._hidden = hit in _HIDE_OPEN
+            self._hidden = hit in self._open
+            if not self._hidden:
+                # Region closed cleanly; its text was never wanted.
+                self._hidden_buf = ""
         held = self._held_len()
-        if not self._hidden:
-            out.append(self._buf[:len(self._buf) - held] if held
-                       else self._buf)
+        ready = self._buf[:len(self._buf) - held] if held else self._buf
+        if self._hidden:
+            self._hidden_buf += ready
+        else:
+            out.append(ready)
         self._buf = self._buf[len(self._buf) - held:] if held else ""
         return "".join(out)
 
     def flush(self) -> str:
         """Release any held-back tail. A partial marker at end of stream was
-        never completed, so it was ordinary text after all."""
-        tail = "" if (self._hidden or self.stopped) else self._buf
+        never completed, so it was ordinary text after all.
+
+        A reasoning region that never closed is released too, rather than
+        swallowing the whole response; .unterminated says it happened.
+        """
+        if self.stopped:
+            tail = ""
+        elif self._hidden:
+            tail = self._hidden_buf + self._buf
+            if tail:
+                self.unterminated = True
+        else:
+            tail = self._buf
         self._buf = ""
+        self._hidden_buf = ""
         return tail
 
 
@@ -569,12 +645,13 @@ class Environment:
     def set_gpu_performance(self):
         for card in glob.glob("/sys/class/drm/card*/device/power_dpm_force_performance_level"):
             try:
-                # Mode "w" implies O_TRUNC, which sysfs attributes reject with
-                # EINVAL; "r+" writes in place. Catch OSError generally: this
-                # is a best-effort tuning step and must never abort startup.
-                with open(card, "r+") as f:
-                    f.write("performance")
-                self.log.info("GPU performance mode set")
+                # power_dpm_force_performance_level takes auto/low/high/manual
+                # or a profile_* name — "performance" is not one of them and
+                # the write fails with EINVAL. Catch OSError generally: this is
+                # a best-effort tuning step and must never abort startup.
+                with open(card, "w") as f:
+                    f.write("high")
+                self.log.info(f"GPU performance mode set on {card}")
             except OSError as e:
                 self.log.warning(f"Could not set GPU performance mode on {card}: {e}")
 
@@ -867,11 +944,15 @@ class InferenceEngine:
         pipeline feeds the NPU's output to the GPU as a prefix to continue, so
         only the answer text is of any use.
 
-        Models outside the Qwen 3 family are handed back untouched. Carrying an
-        inert "/no_think" would be more than cosmetic here — the GPU leg emits a
-        system turn only when the caller supplied one, so inventing a system
-        message on this side would leave draft and continuation working from
-        different instructions.
+        Models outside the Qwen 3 family are handed back untouched, since the
+        directive is inert for them and would only sit in the prompt as noise.
+
+        Note this does not make the two legs agree in every configuration. A
+        Qwen 3 draft still gets an invented system message that a Gemma 4 GPU
+        prompt has no turn for, and _build_prompt_chatml injects a default
+        system message of its own that the draft never sees. Removing the
+        injection here would fix both, but Qwen 3 needs the directive somewhere
+        and moving it to the user turn is untested against a real Qwen model.
         """
         if not wants_no_think(self.config.draft_model):
             return messages
@@ -900,11 +981,28 @@ class InferenceEngine:
         if self.config.gpu_template != "auto":
             return self.config.gpu_template
         name = os.path.basename(self.config.gpu_model).lower()
-        if "gemma-4" in name or "gemma4" in name:
+        if _GEMMA4_RE.search(name):
             return "gemma4"
         # Gemma 2/3 use <start_of_turn>, which is a third format this does not
         # implement; they fall through to ChatML as before.
         return "chatml"
+
+    def _gpu_profile(self) -> dict:
+        return MARKER_PROFILES[self._resolve_template()]
+
+    def _gpu_stop_strings(self) -> List[str]:
+        """Server-side stop strings for llama.cpp.
+
+        The raw /completion endpoint tokenizes the prompt without special-token
+        parsing, so the model emits turn markers as ordinary text and never
+        trips a real EOS. Left to itself it keeps going and invents entire
+        conversation turns until n_predict runs out — which is exactly what
+        happens once a draft prefix has already answered the question.
+        """
+        return list(self._gpu_profile()["stop"])
+
+    def _draft_profile(self) -> dict:
+        return MARKER_PROFILES[draft_profile_name(self.config.draft_model)]
 
     def _build_prompt(self, messages, prefix=""):
         if self._resolve_template() == "gemma4":
@@ -969,7 +1067,7 @@ class InferenceEngine:
         token_count = 0
         async with self._session.post(
                 f"{self.draft_url}/v1/chat/completions", json=payload) as resp:
-            san = StreamSanitizer()
+            san = StreamSanitizer(self._draft_profile())
             async for line in resp.content:
                 line = line.decode("utf-8").strip()
                 if not line.startswith("data: "):
@@ -987,10 +1085,18 @@ class InferenceEngine:
                 if visible:
                     token_count += self.token_counter.count(visible)
                     yield visible
+                if san.stopped:
+                    # Stop reading as soon as the turn ends: the GPU leg waits
+                    # on this generator, so draining the rest would delay it.
+                    break
             tail = san.flush()
             if tail:
                 token_count += self.token_counter.count(tail)
                 yield tail
+            if san.unterminated:
+                self.log.warning(
+                    f"[{request_id}] NPU stream ended inside a reasoning "
+                    f"region; emitting it unstripped")
         elapsed = time.perf_counter() - t0
         await self.metrics.observe("npu_request_duration_ms", elapsed * 1000)
         await self.metrics.observe("npu_tokens_generated", token_count)
@@ -1006,14 +1112,14 @@ class InferenceEngine:
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
             "cache_prompt": cache_prompt,
-            "stop": GPU_STOP_STRINGS,
+            "stop": self._gpu_stop_strings(),
             "stream": True,
         }
         t0 = time.perf_counter()
         token_count = 0
         async with self._session.post(
                 f"{self.gpu_url}/completion", json=payload) as resp:
-            san = StreamSanitizer()
+            san = StreamSanitizer(self._gpu_profile())
             async for line in resp.content:
                 line = line.decode("utf-8").strip()
                 if not line.startswith("data: "):
@@ -1039,6 +1145,10 @@ class InferenceEngine:
             if tail:
                 token_count += self.token_counter.count(tail)
                 yield tail
+            if san.unterminated:
+                self.log.warning(
+                    f"[{request_id}] GPU stream ended inside a reasoning "
+                    f"region; emitting it unstripped")
         elapsed = time.perf_counter() - t0
         await self.metrics.observe("gpu_request_duration_ms", elapsed * 1000)
         await self.metrics.observe("gpu_tokens_generated", token_count)
@@ -1058,7 +1168,7 @@ class InferenceEngine:
                 "n_predict": 1,
                 "temperature": 0.0,
                 "cache_prompt": True,
-                "stop": GPU_STOP_STRINGS,
+                "stop": self._gpu_stop_strings(),
                 "stream": False,
             }
             async with self._session.post(
@@ -1625,6 +1735,9 @@ New in v2.0:
     parser.add_argument("--gpu-backend", default="rocm",
                         choices=["rocm", "vulkan"],
                         help="GPU backend (default: rocm)")
+    parser.add_argument("--gpu-template", default=None,
+                        choices=["auto"] + list(GPU_TEMPLATES),
+                        help="GPU prompt format (default: auto, from model name)")
     parser.add_argument("--draft", default="qwen3:1.7b",
                         help="FLM draft model")
     parser.add_argument("--pmode", default="performance",
@@ -1664,6 +1777,7 @@ New in v2.0:
             draft_port=args.draft_port,
             gpu_model=args.gpu_model or "",
             gpu_backend=args.gpu_backend,
+            gpu_template=args.gpu_template or "auto",
             gpu_port=args.gpu_port,
             gpu_ctx=args.gpu_ctx,
             gpu_layers=args.gpu_layers,
