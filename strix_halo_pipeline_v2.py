@@ -97,6 +97,7 @@ class PipelineConfig:
     gpu_threads: int = 8
     gpu_max_concurrent: int = 4            # NEW: GPU concurrency limit
     gpu_batch_size: int = 4                # NEW: batch prefill size
+    gpu_template: str = "auto"             # auto | gemma4 | chatml
 
     port: int = 11435
     host: str = "0.0.0.0"
@@ -156,6 +157,7 @@ class PipelineConfig:
                 "gpu_threads": self.gpu_threads,
                 "gpu_max_concurrent": self.gpu_max_concurrent,
                 "gpu_batch_size": self.gpu_batch_size,
+                "gpu_template": self.gpu_template,
             },
             "api": {
                 "port": self.port,
@@ -353,6 +355,119 @@ class KVCacheManager:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Control-token sanitizer
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Tokens that end a turn. Both backends are driven through raw-completion or
+# streaming APIs that hand back the model's control tokens as ordinary text,
+# so each family's terminators have to be recognised explicitly.
+EOS_TOKENS = ("<|im_end|>", "<|endoftext|>", "</s>",
+              "<turn|>", "<end_of_turn>", "<eos>")
+
+# Handed to llama.cpp as server-side stop strings. The raw /completion endpoint
+# tokenizes the prompt without special-token parsing, so the model emits turn
+# markers as ordinary text and never trips a real EOS. Left to itself it keeps
+# going and invents entire conversation turns until n_predict runs out — which
+# is exactly what happens once a draft prefix has already answered the question.
+GPU_STOP_STRINGS = list(EOS_TOKENS) + ["<|im_start|>", "<|turn>",
+                                       "<start_of_turn>"]
+
+# Markers that open a hidden region: everything after one is suppressed until
+# the matching close marker.
+_HIDE_OPEN = ("<think>", "<|channel>")
+
+# Markers that close a hidden region. They are also dropped when they appear
+# on their own — the QAT Gemma4 build normally emits "<|channel>thought\n"
+# immediately followed by "<channel|>" with nothing in between, but it also
+# emits a bare "<channel|>" before the answer when it does no thinking pass.
+_HIDE_CLOSE = ("</think>", "<channel|>")
+
+# Qwen 3 switches its reasoning pass off via a "/no_think" directive in the
+# system prompt. That is a Qwen convention, not a general one — every other
+# family ignores the string and simply carries it as noise in the prompt.
+_NO_THINK_PREFIXES = ("qwen3",)
+
+
+def wants_no_think(model: str) -> bool:
+    return model.strip().lower().startswith(_NO_THINK_PREFIXES)
+
+
+# A turn-opener in the output means the model has moved past its own answer
+# into an invented next turn, so it terminates the response just as an
+# end-of-turn marker does.
+_STOP_MARKERS = tuple(GPU_STOP_STRINGS)
+
+_ALL_MARKERS = _HIDE_OPEN + _HIDE_CLOSE + _STOP_MARKERS
+_MAX_MARKER = max(len(m) for m in _ALL_MARKERS)
+
+
+class StreamSanitizer:
+    """Strips reasoning-channel markers from a token stream.
+
+    Models expose their reasoning traces with paired markers — Qwen uses
+    <think>…</think>, Gemma4 uses <|channel>thought…<channel|> — and both leak
+    into the response when the raw stream is forwarded verbatim.
+
+    End-of-turn markers are recognised too, and set .stopped — on a raw
+    completion endpoint they arrive as ordinary text rather than as a real EOS,
+    so the caller has to notice them itself.
+
+    A marker can straddle a chunk boundary, so any suffix that could still grow
+    into a marker is held back rather than emitted; call flush() once the
+    stream ends to release whatever is left.
+    """
+
+    def __init__(self):
+        self._buf = ""
+        self._hidden = False
+        self.stopped = False
+
+    def _held_len(self) -> int:
+        """Length of the trailing run that might still become a marker."""
+        for n in range(min(len(self._buf), _MAX_MARKER - 1), 0, -1):
+            tail = self._buf[-n:]
+            if any(m.startswith(tail) for m in _ALL_MARKERS):
+                return n
+        return 0
+
+    def feed(self, chunk: str) -> str:
+        if self.stopped:
+            return ""
+        self._buf += chunk
+        out = []
+        while True:
+            hit, pos = None, len(self._buf)
+            for m in _ALL_MARKERS:
+                i = self._buf.find(m)
+                if i != -1 and i < pos:
+                    hit, pos = m, i
+            if hit is None:
+                break
+            if not self._hidden:
+                out.append(self._buf[:pos])
+            if hit in _STOP_MARKERS:
+                # End of turn: nothing after it belongs to this response.
+                self.stopped = True
+                self._buf = ""
+                return "".join(out)
+            self._buf = self._buf[pos + len(hit):]
+            self._hidden = hit in _HIDE_OPEN
+        held = self._held_len()
+        if not self._hidden:
+            out.append(self._buf[:len(self._buf) - held] if held
+                       else self._buf)
+        self._buf = self._buf[len(self._buf) - held:] if held else ""
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Release any held-back tail. A partial marker at end of stream was
+        never completed, so it was ordinary text after all."""
+        tail = "" if (self._hidden or self.stopped) else self._buf
+        self._buf = ""
+        return tail
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Metrics
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -396,7 +511,9 @@ class MetricsCollector:
                     lines.append(f"{k}_sum {sum(vals):.3f}")
                     lines.append(f"{k}_p50 {vals[len(vals)//2]:.3f}")
                     lines.append(f"{k}_p99 {vals[int(len(vals)*0.99)]:.3f}")
-            return "\\n".join(lines)
+            # Prometheus exposition requires LF-separated lines and a
+            # trailing newline; a scraper rejects a body without it.
+            return "\n".join(lines) + "\n"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -452,11 +569,14 @@ class Environment:
     def set_gpu_performance(self):
         for card in glob.glob("/sys/class/drm/card*/device/power_dpm_force_performance_level"):
             try:
-                with open(card, "w") as f:
+                # Mode "w" implies O_TRUNC, which sysfs attributes reject with
+                # EINVAL; "r+" writes in place. Catch OSError generally: this
+                # is a best-effort tuning step and must never abort startup.
+                with open(card, "r+") as f:
                     f.write("performance")
                 self.log.info("GPU performance mode set")
-            except PermissionError:
-                pass
+            except OSError as e:
+                self.log.warning(f"Could not set GPU performance mode on {card}: {e}")
 
     def find_flm(self):
         for path in [shutil.which("flm"), "/opt/fastflowlm/bin/flm"]:
@@ -741,6 +861,20 @@ class InferenceEngine:
             await self._session.close()
 
     def _patch_messages(self, messages):
+        """Switch the draft model's reasoning pass off, where it has one.
+
+        A draft that spends its token budget thinking is wasted work: the
+        pipeline feeds the NPU's output to the GPU as a prefix to continue, so
+        only the answer text is of any use.
+
+        Models outside the Qwen 3 family are handed back untouched. Carrying an
+        inert "/no_think" would be more than cosmetic here — the GPU leg emits a
+        system turn only when the caller supplied one, so inventing a system
+        message on this side would leave draft and continuation working from
+        different instructions.
+        """
+        if not wants_no_think(self.config.draft_model):
+            return messages
         patched = []
         has_sys = False
         for m in messages:
@@ -755,22 +889,70 @@ class InferenceEngine:
                                "content": "You are a helpful assistant. /no_think"})
         return patched
 
+    def _resolve_template(self) -> str:
+        """Pick the prompt format for the GPU model.
+
+        The GGUF's own Jinja template is the authority here, but it cannot be
+        used directly: it always closes with a bare generation prompt, and this
+        pipeline has to append the NPU's draft as a partial model turn. So the
+        formats are reproduced by hand and selected from the model name.
+        """
+        if self.config.gpu_template != "auto":
+            return self.config.gpu_template
+        name = os.path.basename(self.config.gpu_model).lower()
+        if "gemma-4" in name or "gemma4" in name:
+            return "gemma4"
+        # Gemma 2/3 use <start_of_turn>, which is a third format this does not
+        # implement; they fall through to ChatML as before.
+        return "chatml"
+
     def _build_prompt(self, messages, prefix=""):
+        if self._resolve_template() == "gemma4":
+            return self._build_prompt_gemma4(messages, prefix)
+        return self._build_prompt_chatml(messages, prefix)
+
+    def _build_prompt_gemma4(self, messages, prefix=""):
+        """Gemma 4's turn format, with the thinking channel suppressed.
+
+        Verified against the model's own template via llama-server's
+        /apply-template. Gemma 4 does not use Gemma 2/3's <start_of_turn>; it
+        wraps turns as <|turn>role\n...<turn|>\n and names the assistant role
+        "model". A system turn is emitted only when one was supplied.
+
+        The generation prompt ends with an empty thought channel
+        ("<|channel>thought\n<channel|>"), which is what the template itself
+        appends when enable_thinking is false: it prefills the reasoning pass as
+        already finished, so the model answers directly instead of emitting a
+        thinking preamble that would only be stripped again downstream.
+        """
+        prompt = ""
+        for m in messages:
+            role, content = m["role"], m["content"]
+            if role == "system":
+                prompt += f"<|turn>system\n{content}<turn|>\n"
+            elif role == "user":
+                prompt += f"<|turn>user\n{content}<turn|>\n"
+            elif role == "assistant":
+                prompt += f"<|turn>model\n{content}<turn|>\n"
+        prompt += f"<|turn>model\n<|channel>thought\n<channel|>{prefix}"
+        return prompt
+
+    def _build_prompt_chatml(self, messages, prefix=""):
         prompt = ""
         has_sys = False
         for m in messages:
             role, content = m["role"], m["content"]
             if role == "system":
                 has_sys = True
-                prompt += f"<|im_start|>system\\n{content}<|im_end|>\\n"
+                prompt += f"<|im_start|>system\n{content}<|im_end|>\n"
             elif role == "user":
-                prompt += f"<|im_start|>user\\n{content}<|im_end|>\\n"
+                prompt += f"<|im_start|>user\n{content}<|im_end|>\n"
             elif role == "assistant":
-                prompt += f"<|im_start|>assistant\\n{content}<|im_end|>\\n"
+                prompt += f"<|im_start|>assistant\n{content}<|im_end|>\n"
         if not has_sys:
-            prompt = ("<|im_start|>system\\nYou are a helpful assistant."
-                      "<|im_end|>\\n" + prompt)
-        prompt += f"<|im_start|>assistant\\n{prefix}"
+            prompt = ("<|im_start|>system\nYou are a helpful assistant."
+                      "<|im_end|>\n" + prompt)
+        prompt += f"<|im_start|>assistant\n{prefix}"
         return prompt
 
     # ── NPU Stream ────────────────────────────────────────────────────────────
@@ -787,7 +969,7 @@ class InferenceEngine:
         token_count = 0
         async with self._session.post(
                 f"{self.draft_url}/v1/chat/completions", json=payload) as resp:
-            in_think = False
+            san = StreamSanitizer()
             async for line in resp.content:
                 line = line.decode("utf-8").strip()
                 if not line.startswith("data: "):
@@ -797,20 +979,18 @@ class InferenceEngine:
                     break
                 try:
                     delta = json.loads(data_str)["choices"][0]["delta"].get("content", "")
-                    if not delta:
-                        continue
-                    if "" in delta:
-                            in_think = False
-                            after = delta.split("", 1)[-1]
-                            if after:
-                                token_count += self.token_counter.count(after)
-                                yield after
-                            continue
-                        continue
-                    token_count += self.token_counter.count(delta)
-                    yield delta
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
+                if not delta:
+                    continue
+                visible = san.feed(delta)
+                if visible:
+                    token_count += self.token_counter.count(visible)
+                    yield visible
+            tail = san.flush()
+            if tail:
+                token_count += self.token_counter.count(tail)
+                yield tail
         elapsed = time.perf_counter() - t0
         await self.metrics.observe("npu_request_duration_ms", elapsed * 1000)
         await self.metrics.observe("npu_tokens_generated", token_count)
@@ -826,12 +1006,14 @@ class InferenceEngine:
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
             "cache_prompt": cache_prompt,
+            "stop": GPU_STOP_STRINGS,
             "stream": True,
         }
         t0 = time.perf_counter()
         token_count = 0
         async with self._session.post(
                 f"{self.gpu_url}/completion", json=payload) as resp:
+            san = StreamSanitizer()
             async for line in resp.content:
                 line = line.decode("utf-8").strip()
                 if not line.startswith("data: "):
@@ -841,19 +1023,22 @@ class InferenceEngine:
                     break
                 try:
                     token = json.loads(data_str).get("content", "")
-                    if not token:
-                        continue
-                    for eos in ["<|im_end|>", "<|endoftext|>", "</s>"]:
-                        if eos in token:
-                            before = token.split(eos)[0]
-                            if before:
-                                token_count += self.token_counter.count(before)
-                                yield before
-                            return
-                    token_count += self.token_counter.count(token)
-                    yield token
                 except (json.JSONDecodeError, KeyError):
                     continue
+                if not token:
+                    continue
+                visible = san.feed(token)
+                if visible:
+                    token_count += self.token_counter.count(visible)
+                    yield visible
+                if san.stopped:
+                    # Break rather than return, so the metrics below still
+                    # record this request.
+                    break
+            tail = san.flush()
+            if tail:
+                token_count += self.token_counter.count(tail)
+                yield tail
         elapsed = time.perf_counter() - t0
         await self.metrics.observe("gpu_request_duration_ms", elapsed * 1000)
         await self.metrics.observe("gpu_tokens_generated", token_count)
@@ -873,6 +1058,7 @@ class InferenceEngine:
                 "n_predict": 1,
                 "temperature": 0.0,
                 "cache_prompt": True,
+                "stop": GPU_STOP_STRINGS,
                 "stream": False,
             }
             async with self._session.post(
@@ -1121,7 +1307,13 @@ class APIServer:
 
     async def _metrics(self, req):
         body = await self.metrics.render()
-        return web.Response(text=body, content_type="text/plain")
+        # The exposition-format version belongs in the Content-Type
+        # parameters, which aiohttp's content_type= argument rejects,
+        # so set the header directly.
+        resp = web.Response(text=body)
+        resp.headers["Content-Type"] = (
+            "text/plain; version=0.0.4; charset=utf-8")
+        return resp
 
     # ── OpenAI format (enhanced streaming) ───────────────────────────────────
 
@@ -1188,7 +1380,7 @@ class APIServer:
                                      "finish_reason": None}],
                     }
                     await resp.write(
-                        f"data: {json.dumps(sse)}\\n\\n".encode())
+                        f"data: {json.dumps(sse)}\n\n".encode())
             finally:
                 watcher.cancel()
                 try:
@@ -1205,8 +1397,8 @@ class APIServer:
                     "choices": [{"index": 0, "delta": {},
                                  "finish_reason": "stop"}],
                 }
-                await resp.write(f"data: {json.dumps(final)}\\n\\n".encode())
-                await resp.write(b"data: [DONE]\\n\\n")
+                await resp.write(f"data: {json.dumps(final)}\n\n".encode())
+                await resp.write(b"data: [DONE]\n\n")
             return resp
         else:
             full = ""
@@ -1261,7 +1453,7 @@ class APIServer:
                     "message": {"role": "assistant", "content": chunk},
                     "done": False,
                 }
-                await resp.write(json.dumps(msg).encode() + b"\\n")
+                await resp.write(json.dumps(msg).encode() + b"\n")
 
             done_msg = {
                 "model": model,
@@ -1272,7 +1464,7 @@ class APIServer:
                 "total_duration": 0,
                 "eval_count": self.engine.token_counter.count(full_text),
             }
-            await resp.write(json.dumps(done_msg).encode() + b"\\n")
+            await resp.write(json.dumps(done_msg).encode() + b"\n")
             return resp
         else:
             full_text = ""
@@ -1319,7 +1511,7 @@ class APIServer:
 # ═════════════════════════════════════════════════════════════════════════════
 
 BANNER = """
-\\033[1;32m
+\033[1;32m
  ======================================================
  STRIX HALO NPU+GPU LLM PIPELINE v{version}
  ======================================================
@@ -1333,7 +1525,7 @@ BANNER = """
  Models: strix-speculative | npu | gpu | auto
  Ctrl+C to stop
  ======================================================
-\\033[0m"""
+\033[0m"""
 
 
 async def run_server(config: PipelineConfig):
